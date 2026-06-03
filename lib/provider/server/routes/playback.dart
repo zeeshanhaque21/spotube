@@ -115,13 +115,37 @@ class ServerPlaybackRoutes {
         "Cache-Control": "max-age=3600",
         "Connection": "keep-alive",
         "host": Uri.parse(url).host,
+        // googlevideo rejects HEAD/un-ranged requests with 403/400, so probe
+        // with a tiny ranged GET (returns 206 + content-range) instead.
+        "Range": "bytes=0-1",
       },
+      responseType: ResponseType.bytes,
       validateStatus: (status) => status! < 400,
     );
 
-    final res = await dio.head(url, options: options);
+    final res = await dio.get(url, options: options);
 
-    return res;
+    // The ranged probe returns content-length:2; the real total size lives in
+    // the content-range header (e.g. "bytes 0-1/1718053"). Rebuild a HEAD-like
+    // 200 response that reports the true total so the player seeks correctly.
+    final contentRangeValue = res.headers.value("content-range");
+    final totalLength = contentRangeValue != null
+        ? ContentRangeHeader.parse(contentRangeValue).total
+        : null;
+
+    return dio_lib.Response(
+      statusCode: 200,
+      headers: Headers.fromMap({
+        "content-type":
+            res.headers["content-type"] ?? ["audio/${track.qualityPreset!.name}"],
+        if (totalLength != null) ...{
+          "content-length": ["$totalLength"],
+          "content-range": ["bytes 0-${totalLength - 1}/$totalLength"],
+        },
+        "accept-ranges": ["bytes"],
+      }),
+      requestOptions: RequestOptions(path: request.requestedUri.toString()),
+    );
   }
 
   Future<dio_lib.Response> streamTrack(
@@ -175,9 +199,16 @@ class ServerPlaybackRoutes {
     );
 
     final contentLengthRes = await Future<dio_lib.Response?>.value(
-      dio.head(
+      dio.get(
         url,
-        options: options.copyWith(responseType: ResponseType.bytes),
+        options: options.copyWith(
+          responseType: ResponseType.bytes,
+          headers: {
+            ...options.headers!,
+            // Probe with a tiny ranged GET; googlevideo 403s on HEAD/un-ranged.
+            "Range": "bytes=0-1",
+          },
+        ),
       ),
     ).catchError((e, stack) async {
       AppLogger.reportError(e, stack);
@@ -188,7 +219,16 @@ class ServerPlaybackRoutes {
 
       url = sourcedTrack.url!;
 
-      return dio.head(url, options: options);
+      return dio.get(
+        url,
+        options: options.copyWith(
+          responseType: ResponseType.bytes,
+          headers: {
+            ...options.headers!,
+            "Range": "bytes=0-1",
+          },
+        ),
+      );
     });
 
     // Redirect to m3u8 link directly as it handles range requests internally
